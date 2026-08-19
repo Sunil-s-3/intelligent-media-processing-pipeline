@@ -44,6 +44,12 @@ class Settings(BaseSettings):
     JOB_TIMEOUT_SECONDS: int = 300
     JOB_RETRY_MAX: int = 2
 
+    # Base URL of the API service, used by workers to download uploaded images
+    # when local storage is not shared (e.g. separate Render services).
+    INTERNAL_API_BASE_URL: str = ""
+    IMAGE_DOWNLOAD_TIMEOUT_SECONDS: int = 60
+    WORKER_TEMP_PATH: str = "/tmp/media_pipeline_worker"
+
     ALLOWED_IMAGE_FORMATS: set[str] = {"JPEG", "PNG", "WEBP", "BMP", "TIFF"}
 
     # Comma-separated browser origins allowed to call the API (CORS).
@@ -68,6 +74,11 @@ class Settings(BaseSettings):
             for origin in self.FRONTEND_ORIGINS.split(",")
             if origin.strip()
         ]
+
+    @property
+    def internal_api_base_url(self) -> str | None:
+        value = self.INTERNAL_API_BASE_URL.strip().rstrip("/")
+        return value or None
 
 
 @lru_cache

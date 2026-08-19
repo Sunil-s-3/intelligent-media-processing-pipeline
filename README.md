@@ -17,7 +17,7 @@ A FastAPI backend for vehicle-image analysis. Clients upload an image, receive a
 - Processing status API (`pending`, `processing`, `completed`, `failed`)
 - Structured results API
 - Docker Compose setup (API, worker, PostgreSQL, Redis)
-- Automated tests (49 tests)
+- Automated tests (58 tests)
 - Optional React dashboard in `frontend/` (bonus)
 
 ## Architecture
@@ -123,12 +123,15 @@ Upload an image via **POST /api/v1/images**, copy the returned `processing_id`, 
 
 The worker processes images asynchronously — allow a few seconds after upload before checking results.
 
+**Render deployment:** When the API and worker run as separate services, set `INTERNAL_API_BASE_URL` on the worker to the API service URL (e.g. `https://your-api.onrender.com`). The worker downloads images from `GET /api/v1/images/{processing_id}/file` when the local file is not present.
+
 ## API Endpoints
 
 | Method | Path | Purpose |
 |---|---|---|
 | GET | `/api/v1/health` | Health check |
 | POST | `/api/v1/images` | Upload image (returns `202`) |
+| GET | `/api/v1/images/{processing_id}/file` | Download stored image (worker/internal use) |
 | GET | `/api/v1/images/{processing_id}/status` | Processing status |
 | GET | `/api/v1/images/{processing_id}/results` | Analysis results |
 
@@ -179,7 +182,7 @@ Each analyzer runs independently — an OCR failure does not stop blur or duplic
 docker compose exec api pytest -q
 ```
 
-**49 passed, 1 warning** (verified). Tests use SQLite in-memory and mock RQ enqueue — no live PostgreSQL, Redis, or Tesseract required in the test suite.
+**58 passed, 1 warning** (verified). Tests use SQLite in-memory and mock RQ enqueue — no live PostgreSQL, Redis, or Tesseract required in the test suite.
 
 **Local pytest** (without Docker):
 

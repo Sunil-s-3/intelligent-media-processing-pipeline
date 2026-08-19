@@ -1,8 +1,18 @@
 import uuid
+from unittest.mock import patch
 
+import httpx
+import pytest
+
+from app.core.config import settings
 from app.db.models import AnalysisResult, Image, ProcessingStatus
-from app.services.processing_service import NonRetryableProcessingError, _process_with_session
-from tests.helpers import noisy_image, save_png, png_bytes
+from app.services.image_access_service import resolve_processing_image_path
+from app.services.processing_service import (
+    NonRetryableProcessingError,
+    RetryableProcessingError,
+    _process_with_session,
+)
+from tests.helpers import noisy_image, png_bytes, save_png
 
 
 def _insert_image(db_session, tmp_path, *, processing_id: str | None = None, missing_file: bool = False) -> Image:
@@ -50,7 +60,8 @@ def test_worker_successful_processing(db_session, tmp_path):
     assert analysis.vehicle_number_result is not None
 
 
-def test_worker_failed_processing_missing_file(db_session, tmp_path):
+def test_worker_failed_processing_missing_file_without_api_fallback(db_session, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "INTERNAL_API_BASE_URL", "")
     record = _insert_image(db_session, tmp_path, missing_file=True)
     try:
         _process_with_session(db_session, record.id)
@@ -61,3 +72,95 @@ def test_worker_failed_processing_missing_file(db_session, tmp_path):
     assert record.status == ProcessingStatus.FAILED.value
     assert record.failure_reason
     assert "missing" in record.failure_reason.lower()
+
+
+def test_worker_downloads_missing_local_file_from_api(db_session, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "INTERNAL_API_BASE_URL", "http://api.test")
+    monkeypatch.setattr(settings, "WORKER_TEMP_PATH", str(tmp_path / "worker-temp"))
+    record = _insert_image(db_session, tmp_path, missing_file=True)
+
+    class FakeResponse:
+        status_code = 200
+        content = png_bytes()
+
+    with patch(
+        "app.services.image_access_service.httpx.Client.get",
+        return_value=FakeResponse(),
+    ) as mock_get:
+        _process_with_session(db_session, record.id)
+        mock_get.assert_called_once_with(
+            f"http://api.test/api/v1/images/{record.id}/file"
+        )
+
+    db_session.refresh(record)
+    assert record.status == ProcessingStatus.COMPLETED.value
+    temp_file = tmp_path / "worker-temp" / record.stored_filename
+    assert not temp_file.exists()
+
+
+def test_worker_download_not_found_is_non_retryable(db_session, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "INTERNAL_API_BASE_URL", "http://api.test")
+    monkeypatch.setattr(settings, "WORKER_TEMP_PATH", str(tmp_path / "worker-temp"))
+    record = _insert_image(db_session, tmp_path, missing_file=True)
+
+    class FakeResponse:
+        status_code = 404
+        content = b""
+
+    with patch("app.services.image_access_service.httpx.Client.get", return_value=FakeResponse()):
+        with pytest.raises(NonRetryableProcessingError):
+            _process_with_session(db_session, record.id)
+
+    db_session.refresh(record)
+    assert record.status == ProcessingStatus.FAILED.value
+    assert "not found" in record.failure_reason.lower()
+
+
+def test_worker_download_timeout_is_retryable(db_session, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "INTERNAL_API_BASE_URL", "http://api.test")
+    monkeypatch.setattr(settings, "WORKER_TEMP_PATH", str(tmp_path / "worker-temp"))
+    record = _insert_image(db_session, tmp_path, missing_file=True)
+
+    with patch(
+        "app.services.image_access_service.httpx.Client.get",
+        side_effect=httpx.TimeoutException("timed out"),
+    ):
+        with pytest.raises(RetryableProcessingError):
+            _process_with_session(db_session, record.id)
+
+    db_session.refresh(record)
+    assert record.status == ProcessingStatus.PROCESSING.value
+
+
+def test_worker_download_connection_error_is_retryable(db_session, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "INTERNAL_API_BASE_URL", "http://api.test")
+    monkeypatch.setattr(settings, "WORKER_TEMP_PATH", str(tmp_path / "worker-temp"))
+    record = _insert_image(db_session, tmp_path, missing_file=True)
+
+    with patch(
+        "app.services.image_access_service.httpx.Client.get",
+        side_effect=httpx.ConnectError("connection refused"),
+    ):
+        with pytest.raises(RetryableProcessingError):
+            _process_with_session(db_session, record.id)
+
+    db_session.refresh(record)
+    assert record.status == ProcessingStatus.PROCESSING.value
+
+
+def test_resolve_processing_image_path_cleans_up_temp_file(db_session, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "INTERNAL_API_BASE_URL", "http://api.test")
+    monkeypatch.setattr(settings, "WORKER_TEMP_PATH", str(tmp_path / "worker-temp"))
+    record = _insert_image(db_session, tmp_path, missing_file=True)
+    temp_file = tmp_path / "worker-temp" / record.stored_filename
+
+    class FakeResponse:
+        status_code = 200
+        content = png_bytes()
+
+    with patch("app.services.image_access_service.httpx.Client.get", return_value=FakeResponse()):
+        with resolve_processing_image_path(record) as image_path:
+            assert image_path.is_file()
+            assert image_path == temp_file
+
+    assert not temp_file.exists()

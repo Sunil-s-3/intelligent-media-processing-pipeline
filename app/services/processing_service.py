@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from pathlib import Path
 
 from sqlalchemy.orm import Session
 
@@ -20,6 +19,12 @@ from app.analyzers.plate_validator import validate_indian_plate
 from app.analyzers.screenshot import analyze_screenshot
 from app.db.database import SessionLocal
 from app.db.models import AnalysisResult, Image, ProcessingStatus
+from app.services.image_access_service import (
+    ImageDownloadNotFoundError,
+    ImageDownloadTransientError,
+    ImageFileMissingError,
+    resolve_processing_image_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,64 +99,70 @@ def _process_with_session(db: Session, processing_id: str) -> None:
     image.updated_at = _utcnow()
     db.commit()
 
-    stored = Path(image.storage_path)
-    if not stored.is_file():
-        _mark_failed(db, image, "Stored image file is missing on disk")
-        raise NonRetryableProcessingError("Stored image file is missing")
-
     try:
-        blur = _run_analyzer("blur", processing_id, analyze_blur, stored)
-        brightness = _run_analyzer("brightness", processing_id, analyze_brightness, stored)
-        screenshot = _run_analyzer("screenshot", processing_id, analyze_screenshot, stored)
+        with resolve_processing_image_path(image) as stored:
+            blur = _run_analyzer("blur", processing_id, analyze_blur, stored)
+            brightness = _run_analyzer("brightness", processing_id, analyze_brightness, stored)
+            screenshot = _run_analyzer("screenshot", processing_id, analyze_screenshot, stored)
 
-        try:
-            phash = compute_phash(stored)
-        except Exception as exc:
-            _mark_failed(db, image, f"Unable to decode image for hashing: {exc}")
-            raise NonRetryableProcessingError("Unable to decode image") from exc
+            try:
+                phash = compute_phash(stored)
+            except Exception as exc:
+                _mark_failed(db, image, f"Unable to decode image for hashing: {exc}")
+                raise NonRetryableProcessingError("Unable to decode image") from exc
 
-        image.perceptual_hash = phash
-        db.commit()
+            image.perceptual_hash = phash
+            db.commit()
 
-        duplicate = _run_analyzer(
-            "duplicate",
-            processing_id,
-            analyze_duplicate,
-            stored,
-            image_id=processing_id,
-            db=db,
-        )
-        ocr = _run_analyzer("ocr", processing_id, analyze_ocr, stored)
-        plate = validate_indian_plate(ocr.get("cleaned_text") or ocr.get("ocr_text"))
-        if not plate.get("format_valid") and ocr.get("plate_ocr_text"):
-            plate_from_region = validate_indian_plate(ocr.get("plate_ocr_text"))
-            if plate_from_region.get("format_valid"):
-                plate = plate_from_region
-
-        if image.analysis is None:
-            result = AnalysisResult(
-                image_id=image.id,
-                blur_result=blur,
-                brightness_result=brightness,
-                duplicate_result=duplicate,
-                ocr_result=ocr,
-                vehicle_number_result=plate,
-                screenshot_result=screenshot,
+            duplicate = _run_analyzer(
+                "duplicate",
+                processing_id,
+                analyze_duplicate,
+                stored,
+                image_id=processing_id,
+                db=db,
             )
-            db.add(result)
-        else:
-            image.analysis.blur_result = blur
-            image.analysis.brightness_result = brightness
-            image.analysis.duplicate_result = duplicate
-            image.analysis.ocr_result = ocr
-            image.analysis.vehicle_number_result = plate
-            image.analysis.screenshot_result = screenshot
+            ocr = _run_analyzer("ocr", processing_id, analyze_ocr, stored)
+            plate = validate_indian_plate(ocr.get("cleaned_text") or ocr.get("ocr_text"))
+            if not plate.get("format_valid") and ocr.get("plate_ocr_text"):
+                plate_from_region = validate_indian_plate(ocr.get("plate_ocr_text"))
+                if plate_from_region.get("format_valid"):
+                    plate = plate_from_region
 
-        image.status = ProcessingStatus.COMPLETED.value
-        image.failure_reason = None
-        image.updated_at = _utcnow()
-        db.commit()
-        logger.info("job completed", extra={"processing_id": processing_id})
+            if image.analysis is None:
+                result = AnalysisResult(
+                    image_id=image.id,
+                    blur_result=blur,
+                    brightness_result=brightness,
+                    duplicate_result=duplicate,
+                    ocr_result=ocr,
+                    vehicle_number_result=plate,
+                    screenshot_result=screenshot,
+                )
+                db.add(result)
+            else:
+                image.analysis.blur_result = blur
+                image.analysis.brightness_result = brightness
+                image.analysis.duplicate_result = duplicate
+                image.analysis.ocr_result = ocr
+                image.analysis.vehicle_number_result = plate
+                image.analysis.screenshot_result = screenshot
+
+            image.status = ProcessingStatus.COMPLETED.value
+            image.failure_reason = None
+            image.updated_at = _utcnow()
+            db.commit()
+            logger.info("job completed", extra={"processing_id": processing_id})
+    except ImageDownloadTransientError as exc:
+        logger.warning(
+            "temporary image download failure error=%s",
+            exc,
+            extra={"processing_id": processing_id},
+        )
+        raise RetryableProcessingError(str(exc)) from exc
+    except (ImageFileMissingError, ImageDownloadNotFoundError) as exc:
+        _mark_failed(db, image, str(exc))
+        raise NonRetryableProcessingError(str(exc)) from exc
     except NonRetryableProcessingError:
         raise
     except Exception as exc:

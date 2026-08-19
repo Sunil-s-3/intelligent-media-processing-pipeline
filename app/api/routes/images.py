@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, File, UploadFile, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
@@ -10,6 +10,7 @@ from app.schemas.image import (
     StatusResponse,
     UploadAcceptedResponse,
 )
+from app.services.image_access_service import get_api_stored_image_path
 from app.services.query_service import build_results_payload, get_image_or_404
 from app.services.upload_service import upload_image
 
@@ -50,6 +51,20 @@ def get_status(processing_id: str, db: Session = Depends(get_db)) -> StatusRespo
     if record.status == ProcessingStatus.FAILED.value:
         payload.failure_reason = record.failure_reason
     return payload
+
+
+@router.get(
+    "/{processing_id}/file",
+    responses={404: {"model": ErrorResponse}},
+)
+def get_image_file(processing_id: str, db: Session = Depends(get_db)) -> FileResponse:
+    record = get_image_or_404(db, processing_id)
+    file_path = get_api_stored_image_path(record)
+    return FileResponse(
+        path=file_path,
+        media_type=record.mime_type,
+        filename=record.original_filename,
+    )
 
 
 @router.get(
