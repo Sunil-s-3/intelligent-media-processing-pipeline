@@ -18,6 +18,7 @@ from PIL import Image as PILImage
 
 from app.analyzers.common import clamp_confidence, load_bgr
 from app.analyzers.plate_validator import validate_indian_plate
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,20 @@ _MIN_ASPECT = 2.0
 _MAX_ASPECT = 7.0
 _MIN_AREA_RATIO = 0.0005
 _MAX_AREA_RATIO = 0.20
-_MAX_REGIONS = 10
+_MAX_REGIONS = 6
+
+
+def _tesseract_timeout_seconds() -> int:
+    return settings.OCR_TIMEOUT_SECONDS
+
+
+def _is_tesseract_timeout(exc: Exception) -> bool:
+    return isinstance(exc, RuntimeError) and "timeout" in str(exc).lower()
+
+
+def _bgr_to_pil(image_bgr: np.ndarray) -> PILImage.Image:
+    rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    return PILImage.fromarray(rgb)
 
 
 def _tesseract_available() -> tuple[bool, str | None]:
@@ -197,8 +211,14 @@ def _run_plate_tesseract(image: np.ndarray, psm: int) -> tuple[str, float]:
         f"--oem 3 --psm {psm} "
         f"-c tessedit_char_whitelist={_PLATE_WHITELIST}"
     )
-    raw_text = pytesseract.image_to_string(pil_image, config=config)
-    data = pytesseract.image_to_data(pil_image, config=config, output_type=pytesseract.Output.DICT)
+    timeout = _tesseract_timeout_seconds()
+    raw_text = pytesseract.image_to_string(pil_image, config=config, timeout=timeout)
+    data = pytesseract.image_to_data(
+        pil_image,
+        config=config,
+        timeout=timeout,
+        output_type=pytesseract.Output.DICT,
+    )
     cleaned = _clean_text(raw_text)
     confidence = _ocr_confidence_from_data(data)
     return cleaned, confidence
@@ -226,6 +246,12 @@ def _extract_plate_ocr(image_bgr: np.ndarray) -> dict:
             for psm in _PLATE_PSM_MODES:
                 try:
                     text, confidence = _run_plate_tesseract(variant, psm)
+                except RuntimeError as exc:
+                    if _is_tesseract_timeout(exc):
+                        logger.debug("plate OCR attempt timed out")
+                        continue
+                    logger.debug("plate OCR attempt failed: %s", exc)
+                    continue
                 except Exception as exc:
                     logger.debug("plate OCR attempt failed: %s", exc)
                     continue
@@ -273,10 +299,17 @@ def analyze_ocr(image_path: Path) -> dict:
             ),
         }
 
+    timeout = _tesseract_timeout_seconds()
     try:
-        with PILImage.open(image_path) as img:
-            data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
-            raw_text = pytesseract.image_to_string(img)
+        image_bgr = load_bgr(image_path)
+        pil_image = _bgr_to_pil(image_bgr)
+        data = pytesseract.image_to_data(
+            pil_image,
+            timeout=timeout,
+            output_type=pytesseract.Output.DICT,
+        )
+        raw_text = pytesseract.image_to_string(pil_image, timeout=timeout)
+        del pil_image
     except pytesseract.TesseractNotFoundError as exc:
         return {
             "status": "unavailable",
@@ -284,6 +317,22 @@ def analyze_ocr(image_path: Path) -> dict:
             "cleaned_text": None,
             "confidence": 0.0,
             "reason": f"Tesseract OCR became unavailable during extraction: {exc}",
+        }
+    except RuntimeError as exc:
+        if _is_tesseract_timeout(exc):
+            return {
+                "status": "failed",
+                "ocr_text": None,
+                "cleaned_text": None,
+                "confidence": 0.0,
+                "reason": f"OCR extraction timed out after {timeout} seconds",
+            }
+        return {
+            "status": "failed",
+            "ocr_text": None,
+            "cleaned_text": None,
+            "confidence": 0.0,
+            "reason": f"OCR extraction failed: {exc}",
         }
     except Exception as exc:
         return {
@@ -313,10 +362,16 @@ def analyze_ocr(image_path: Path) -> dict:
         "candidate_count": 0,
     }
     try:
-        image_bgr = load_bgr(image_path)
         plate_fields = _extract_plate_ocr(image_bgr)
+    except RuntimeError as exc:
+        if _is_tesseract_timeout(exc):
+            logger.warning("plate-focused OCR timed out after %s seconds", timeout)
+        else:
+            logger.warning("plate-focused OCR failed: %s", exc)
     except Exception as exc:
         logger.warning("plate-focused OCR failed: %s", exc)
+    finally:
+        del image_bgr
 
     full_image_valid = validate_indian_plate(cleaned or raw_text.strip() or None)
     plate_focus_valid = (

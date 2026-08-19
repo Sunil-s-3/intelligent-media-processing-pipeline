@@ -50,6 +50,10 @@ class Settings(BaseSettings):
     IMAGE_DOWNLOAD_TIMEOUT_SECONDS: int = 60
     WORKER_TEMP_PATH: str = "/tmp/media_pipeline_worker"
 
+    # Downscale very large images before analyzers to reduce memory use (Render/free tier).
+    MAX_PROCESSING_DIMENSION: int = 1600
+    OCR_TIMEOUT_SECONDS: int = 45
+
     ALLOWED_IMAGE_FORMATS: set[str] = {"JPEG", "PNG", "WEBP", "BMP", "TIFF"}
 
     # Comma-separated browser origins allowed to call the API (CORS).

@@ -7,6 +7,7 @@ Unrecoverable errors (missing file, decode failure) mark the image as failed.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
@@ -25,6 +26,7 @@ from app.services.image_access_service import (
     ImageFileMissingError,
     resolve_processing_image_path,
 )
+from app.services.image_preprocess_service import prepare_processing_image
 
 logger = logging.getLogger(__name__)
 
@@ -54,19 +56,24 @@ def _mark_failed(db: Session, image: Image, reason: str) -> None:
 
 
 def _run_analyzer(name: str, processing_id: str, func, *args, **kwargs) -> dict:
+    started = time.perf_counter()
     logger.info("analyzer started name=%s", name, extra={"processing_id": processing_id})
     try:
         result = func(*args, **kwargs)
+        duration = time.perf_counter() - started
         logger.info(
-            "analyzer completed name=%s",
+            "analyzer completed name=%s duration_seconds=%.3f",
             name,
+            duration,
             extra={"processing_id": processing_id},
         )
         return result
     except Exception as exc:
+        duration = time.perf_counter() - started
         logger.exception(
-            "analyzer failed name=%s error=%s",
+            "analyzer failed name=%s duration_seconds=%.3f error=%s",
             name,
+            duration,
             exc,
             extra={"processing_id": processing_id},
         )
@@ -114,58 +121,63 @@ def _process_with_session(db: Session, processing_id: str) -> None:
 
     try:
         with resolve_processing_image_path(image) as stored:
-            blur = _run_analyzer("blur", processing_id, analyze_blur, stored)
-            brightness = _run_analyzer("brightness", processing_id, analyze_brightness, stored)
-            screenshot = _run_analyzer("screenshot", processing_id, analyze_screenshot, stored)
-
-            try:
-                phash = compute_phash(stored)
-            except Exception as exc:
-                _mark_failed(db, image, f"Unable to decode image for hashing: {exc}")
-                raise NonRetryableProcessingError("Unable to decode image") from exc
-
-            image.perceptual_hash = phash
-            db.commit()
-
-            duplicate = _run_analyzer(
-                "duplicate",
-                processing_id,
-                analyze_duplicate,
-                stored,
-                image_id=processing_id,
-                db=db,
-            )
-            ocr = _run_analyzer("ocr", processing_id, analyze_ocr, stored)
-            plate = validate_indian_plate(ocr.get("cleaned_text") or ocr.get("ocr_text"))
-            if not plate.get("format_valid") and ocr.get("plate_ocr_text"):
-                plate_from_region = validate_indian_plate(ocr.get("plate_ocr_text"))
-                if plate_from_region.get("format_valid"):
-                    plate = plate_from_region
-
-            if image.analysis is None:
-                result = AnalysisResult(
-                    image_id=image.id,
-                    blur_result=blur,
-                    brightness_result=brightness,
-                    duplicate_result=duplicate,
-                    ocr_result=ocr,
-                    vehicle_number_result=plate,
-                    screenshot_result=screenshot,
+            with prepare_processing_image(stored) as processing_path:
+                blur = _run_analyzer("blur", processing_id, analyze_blur, processing_path)
+                brightness = _run_analyzer(
+                    "brightness", processing_id, analyze_brightness, processing_path
                 )
-                db.add(result)
-            else:
-                image.analysis.blur_result = blur
-                image.analysis.brightness_result = brightness
-                image.analysis.duplicate_result = duplicate
-                image.analysis.ocr_result = ocr
-                image.analysis.vehicle_number_result = plate
-                image.analysis.screenshot_result = screenshot
+                screenshot = _run_analyzer(
+                    "screenshot", processing_id, analyze_screenshot, processing_path
+                )
 
-            image.status = ProcessingStatus.COMPLETED.value
-            image.failure_reason = None
-            image.updated_at = _utcnow()
-            db.commit()
-            logger.info("job completed", extra={"processing_id": processing_id})
+                try:
+                    phash = compute_phash(processing_path)
+                except Exception as exc:
+                    _mark_failed(db, image, f"Unable to decode image for hashing: {exc}")
+                    raise NonRetryableProcessingError("Unable to decode image") from exc
+
+                image.perceptual_hash = phash
+                db.commit()
+
+                duplicate = _run_analyzer(
+                    "duplicate",
+                    processing_id,
+                    analyze_duplicate,
+                    processing_path,
+                    image_id=processing_id,
+                    db=db,
+                )
+                ocr = _run_analyzer("ocr", processing_id, analyze_ocr, processing_path)
+                plate = validate_indian_plate(ocr.get("cleaned_text") or ocr.get("ocr_text"))
+                if not plate.get("format_valid") and ocr.get("plate_ocr_text"):
+                    plate_from_region = validate_indian_plate(ocr.get("plate_ocr_text"))
+                    if plate_from_region.get("format_valid"):
+                        plate = plate_from_region
+
+                if image.analysis is None:
+                    result = AnalysisResult(
+                        image_id=image.id,
+                        blur_result=blur,
+                        brightness_result=brightness,
+                        duplicate_result=duplicate,
+                        ocr_result=ocr,
+                        vehicle_number_result=plate,
+                        screenshot_result=screenshot,
+                    )
+                    db.add(result)
+                else:
+                    image.analysis.blur_result = blur
+                    image.analysis.brightness_result = brightness
+                    image.analysis.duplicate_result = duplicate
+                    image.analysis.ocr_result = ocr
+                    image.analysis.vehicle_number_result = plate
+                    image.analysis.screenshot_result = screenshot
+
+                image.status = ProcessingStatus.COMPLETED.value
+                image.failure_reason = None
+                image.updated_at = _utcnow()
+                db.commit()
+                logger.info("job completed", extra={"processing_id": processing_id})
     except ImageDownloadTransientError as exc:
         logger.warning(
             "temporary image download failure error=%s",

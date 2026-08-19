@@ -10,6 +10,7 @@ from app.analyzers.ocr import (
     _extract_plate_ocr,
 )
 from app.analyzers.plate_validator import validate_indian_plate
+from app.core.config import settings
 from tests.helpers import save_png, text_image
 
 
@@ -128,3 +129,19 @@ def test_ocr_empty_text_is_completed_without_fabrication(tmp_path):
     assert result["status"] == "completed"
     assert result["ocr_text"] is None
     assert "no readable" in result["reason"].lower()
+
+
+def test_ocr_timeout_returns_failed_without_raising(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "OCR_TIMEOUT_SECONDS", 5)
+    path = save_png(tmp_path / "scene.png", text_image("KA01AB1234"))
+
+    with patch("app.analyzers.ocr._tesseract_available", return_value=(True, None)):
+        with patch(
+            "app.analyzers.ocr.pytesseract.image_to_data",
+            side_effect=RuntimeError("Tesseract process timeout"),
+        ):
+            result = analyze_ocr(path)
+
+    assert result["status"] == "failed"
+    assert result["ocr_text"] is None
+    assert "timed out" in result["reason"].lower()

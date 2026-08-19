@@ -9,7 +9,7 @@ alembic upgrade head
 
 RQ_QUEUE="${RQ_QUEUE_NAME:-image_jobs}"
 
-rq worker "$RQ_QUEUE" --url "${REDIS_URL}" &
+python -m app.workers.run_worker &
 WORKER_PID=$!
 
 uvicorn app.main:app --host 0.0.0.0 --port 8000 &

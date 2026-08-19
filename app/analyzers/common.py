@@ -25,6 +25,27 @@ def load_bgr(path: Path) -> BgrImage:
     return image
 
 
+def compute_downscale_size(
+    width: int,
+    height: int,
+    max_dimension: int,
+) -> tuple[int, int] | None:
+    """Return a new (width, height) if downscaling is needed, else None."""
+    if max(width, height) <= max_dimension:
+        return None
+    scale = max_dimension / max(width, height)
+    return max(1, int(width * scale)), max(1, int(height * scale))
+
+
+def downscale_bgr(image: BgrImage, max_dimension: int) -> BgrImage:
+    """Downscale a BGR image preserving aspect ratio. Returns the original if already small."""
+    height, width = image.shape[:2]
+    new_size = compute_downscale_size(width, height, max_dimension)
+    if new_size is None:
+        return image
+    return cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
+
+
 def clamp_confidence(value: float) -> float:
     """Keep heuristic confidence in [0, 1] and round for stable JSON."""
     return round(min(1.0, max(0.0, value)), 4)

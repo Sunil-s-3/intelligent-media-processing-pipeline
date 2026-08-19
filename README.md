@@ -125,6 +125,8 @@ The worker processes images asynchronously — allow a few seconds after upload 
 
 **Render deployment:** When the API and worker run as separate services, set `INTERNAL_API_BASE_URL` on the worker to the API service URL (e.g. `https://your-api.onrender.com`). The worker downloads images from `GET /api/v1/images/{processing_id}/file` when the local file is not present.
 
+On low-memory hosts (Render free tier), tune `MAX_PROCESSING_DIMENSION` (default `1600`) and `OCR_TIMEOUT_SECONDS` (default `45`) to limit memory use and prevent Tesseract from running indefinitely. The combined Render startup script uses `python -m app.workers.run_worker` so unexpected worker kills mark the processing record as `failed`.
+
 ## API Endpoints
 
 | Method | Path | Purpose |

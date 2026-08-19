@@ -235,3 +235,43 @@ def test_process_image_job_marks_failed_when_retries_exhausted():
                     "b368827f-7718-43a6-b6ab-bad2b6abf850",
                     "Processing failed after retries: download timed out",
                 )
+
+
+def test_worker_analyzer_failure_still_completes(db_session, tmp_path):
+    record = _insert_image(db_session, tmp_path)
+    failed_blur = {
+        "status": "failed",
+        "detected": None,
+        "confidence": 0.0,
+        "reason": "blur analyzer failed: simulated",
+    }
+
+    with patch("app.services.processing_service.analyze_blur", side_effect=RuntimeError("simulated")):
+        _process_with_session(db_session, record.id)
+
+    db_session.refresh(record)
+    assert record.status == ProcessingStatus.COMPLETED.value
+    analysis = db_session.query(AnalysisResult).filter_by(image_id=record.id).one()
+    assert analysis.blur_result["status"] == "failed"
+    assert "simulated" in analysis.blur_result["reason"]
+
+
+def test_pipeline_worker_marks_failed_when_work_horse_killed():
+    from types import SimpleNamespace as NS
+    from unittest.mock import MagicMock
+
+    from app.workers.pipeline_worker import PipelineWorker
+
+    processing_id = "b368827f-7718-43a6-b6ab-bad2b6abf850"
+    job = NS(
+        func_name="app.queue.jobs.process_image_job",
+        args=[processing_id],
+    )
+
+    with patch("app.workers.pipeline_worker.mark_processing_failed") as mark_failed:
+        worker = PipelineWorker(["image_jobs"], connection=MagicMock())
+        worker.handle_work_horse_killed(job, 30, -9, None)
+        mark_failed.assert_called_once_with(
+            processing_id,
+            "Worker process terminated unexpectedly (likely out of memory)",
+        )
