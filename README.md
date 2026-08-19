@@ -246,16 +246,59 @@ Internal Python stack traces are logged server-side and are never returned in JS
 
 ---
 
-## 11. Design Decisions
+## 11. Queue Strategy
 
-- **Redis + RQ for asynchronous processing.** Keeps the API free of CPU-heavy OCR and analysis work, with built-in retry support.
-- **PostgreSQL JSONB for analyzer results.** Payloads can evolve without a schema migration per field.
-- **Independent analyzers.** Each analyzer is isolated inside the worker so one failure does not abort the others.
-- **Local storage.** No cloud credentials needed for a take-home; the API and worker share files through a named Docker volume.
+Redis + RQ was chosen for the background queue because:
+
+- It matches the assignment's specified stack
+- It keeps the API process free of CPU-heavy OCR and image analysis work
+- Built-in `Retry` support handles transient worker failures without a second message bus
+- The operational model is simple: one named queue (`image_jobs`), one worker command
+
+RQ is not Kafka, Celery, or a custom broker. For a take-home assignment that is a deliberate feature — fewer moving parts with the same async decoupling. Non-retryable failures (corrupt or missing images) are caught inside the job and marked `failed` without re-queuing; transient infrastructure errors are re-raised so RQ can retry up to `JOB_RETRY_MAX` times.
 
 ---
 
-## 12. Limitations
+## 12. Assumptions
+
+- Uploaded files are expected to be still images (JPEG, PNG, WEBP, BMP, TIFF); video is not supported
+- Indian vehicle registration validation is format validation only — it does not verify that a plate is genuine, issued, or correctly read by OCR
+- Local filesystem storage is acceptable for a take-home environment where the API and worker run on the same host via Docker Compose
+- Heuristic analysis (blur, brightness, duplicate, screenshot) is intended to flag possible issues, not prove them; confidence values are not calibrated ML probabilities
+- English Tesseract language data is sufficient for this use case
+- A linear pHash database scan is acceptable at take-home dataset scale
+
+---
+
+## 13. Design Decisions & Trade-offs
+
+| Decision | Rationale | Trade-off |
+|---|---|---|
+| Redis + RQ | Simple, assignment-specified, process isolation, retry support | Less tooling than Celery; no delayed routing beyond Retry |
+| Local filesystem | No cloud credentials required; easy Docker volume sharing | Not suitable for multi-host or production deployments |
+| PostgreSQL JSONB for results | Analyzer output shapes can evolve without schema migrations | Weaker column-level constraints than typed columns |
+| Independent analyzers | One analyzer failure does not abort the others | Each failure is isolated; the job still completes |
+| Heuristic analysis | Honest about uncertainty; matches assignment intent | False positives and negatives are possible; thresholds need tuning |
+| SQLite in tests | Tests run without Docker, PostgreSQL, Redis, or Tesseract | JSONB-specific PostgreSQL behaviour is not exercised in pytest |
+| Processing ID = `images.id` | One UUID, no extra lookup column | None for this scale |
+
+---
+
+## 14. Scalability Considerations
+
+The current implementation is intentionally scoped for a take-home assignment and is not designed for large-scale production use.
+
+| Area | Current approach | Production path |
+|---|---|---|
+| Image storage | Local filesystem via Docker volume | Object storage (S3/GCS); DB stores object keys |
+| Duplicate detection | Linear pHash scan across all stored hashes | Approximate nearest-neighbour index (FAISS, pgvector) |
+| Workers | Single RQ worker process | Multiple workers; queue partitioning by priority |
+| API scaling | Single Uvicorn process | Horizontal replicas behind a load balancer |
+| Queue monitoring | RQ built-in | Dead-letter registry, metrics, structured log collector |
+
+---
+
+## 15. Limitations
 
 - Local storage is not suitable for multi-host production deployment
 - pHash duplicate detection uses a full database scan and will not scale to very large datasets
@@ -265,7 +308,7 @@ Internal Python stack traces are logged server-side and are never returned in JS
 
 ---
 
-## 13. Future Improvements
+## 16. Future Improvements
 
 - Object storage such as S3/GCS
 - Multiple workers and queue partitioning
@@ -275,7 +318,7 @@ Internal Python stack traces are logged server-side and are never returned in JS
 
 ---
 
-## 14. Validation
+## 17. Validation (Verified Results)
 
 | Check | Result |
 |---|---|
@@ -293,9 +336,29 @@ Internal Python stack traces are logged server-side and are never returned in JS
 
 ---
 
-## 15. AI Usage Disclosure
+## 18. AI Usage Disclosure
 
-Cursor/AI tools were used during development for implementation assistance, boilerplate generation, debugging, test creation, and documentation. Generated code was reviewed, modified where necessary, and validated using automated tests and the Docker Compose workflow.
+Cursor/AI tools were used during development for:
+
+- Implementation assistance and boilerplate generation (FastAPI app, SQLAlchemy models, Alembic migration, Docker Compose, config and logging setup)
+- Image analyzer implementations (OpenCV Laplacian blur, mean brightness, imagehash pHash duplicates, pytesseract OCR, plate regex, EXIF screenshot heuristic)
+- Test creation (pytest + TestClient cases for upload, status, results, analyzers, OCR isolation, worker paths)
+- Debugging and review (exception handler tightening, chunked upload size check, worker migration wait)
+- Documentation (this README)
+
+All generated code was reviewed, modified where necessary, and validated using the automated test suite and Docker Compose end-to-end workflow.
+
+**Concrete example of an AI-generated error and how it was corrected:**
+
+The initial vehicle-number validator used broad normalization: it stripped all non-alphanumeric characters from the entire OCR text and then searched the resulting concatenated string with a regex. This caused a false positive during API testing — the OCR text `"Tuesday, 17 Feb 2026 11:22 AM Perambur High Road"` was normalized to `"TUESDAY17FEB202611..."` and the regex found `"AY17FEB2026"` within that string, incorrectly returning `format_valid: true` with `matched_value: "AY17FEB2026"`.
+
+**How it was detected:** Manual API testing with a real image whose OCR output contained a date and address string — common in field-photographed images — produced an obviously wrong plate number.
+
+**What was changed:** The validator was refactored to use boundary-aware token matching. The OCR text is first split into alphanumeric tokens on whitespace and punctuation boundaries. Only short windows of consecutive tokens (up to 6) are joined and tested against the full plate pattern. This means `"Tuesday"`, `"17"`, `"Feb"`, `"2026"` are never concatenated across word boundaries into a candidate string.
+
+**How the fix was validated:** A regression test (`test_observed_ocr_dump_does_not_fabricate_ay17feb2026`) was added using the exact OCR text that triggered the false positive. Additional tests cover date strings, hyphenated dates, address text, and embedded legitimate plates. All 43 tests pass, including this regression test, and the API was re-verified manually through Swagger.
+
+**Validation summary:**
 
 - 43 automated tests passed (Python 3.11, SQLite in-memory, RQ enqueue mocked)
 - Docker Compose was successfully built and run end-to-end
@@ -303,6 +366,6 @@ Cursor/AI tools were used during development for implementation assistance, boil
 
 ---
 
-## 16. Submission
+## 19. Submission
 
 This repository contains the application source code, tests, Docker configuration, database migration, configuration example, and documentation required to run and evaluate the assignment.
