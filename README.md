@@ -1,131 +1,141 @@
 # Intelligent Media Processing Pipeline
 
-## 1. Overview
+A FastAPI backend for vehicle-image analysis. Clients upload an image, receive a `processing_id` immediately, and poll for status while a background worker runs heuristic checks (blur, brightness, duplicate, OCR, plate format, screenshot signals). Results are stored in PostgreSQL and returned as structured JSON. Confidence values are heuristic indicators, not calibrated ML probabilities.
 
-This is a FastAPI backend that accepts vehicle images and returns structured heuristic analysis. Uploads return immediately — the API validates the file, stores it, creates a UUID `processing_id`, enqueues a Redis + RQ background job, and responds with `202 Accepted` before any analysis begins. A separate RQ worker picks up each job, runs all image analyzers, and persists results to PostgreSQL. Clients poll a status endpoint and fetch results when ready.
+## Features
 
----
+- Image upload API (`multipart/form-data`, field name: `image`)
+- Asynchronous processing via Redis + RQ
+- PostgreSQL metadata and JSONB analysis results
+- Local image storage (Docker volume)
+- Blur detection (variance of Laplacian)
+- Brightness detection (mean grayscale)
+- Duplicate detection (perceptual hash + Hamming distance)
+- OCR (Tesseract)
+- Indian vehicle registration format validation (boundary-aware regex)
+- Screenshot/editing heuristics (EXIF and resolution signals)
+- Processing status API (`pending`, `processing`, `completed`, `failed`)
+- Structured results API
+- Docker Compose setup (API, worker, PostgreSQL, Redis)
+- Automated tests (49 tests)
+- Optional React dashboard in `frontend/` (bonus)
 
-## 2. Features
-
-- Asynchronous image processing
-- FastAPI REST API with Swagger/OpenAPI
-- PostgreSQL metadata and JSONB results
-- Redis + RQ background worker
-- Blur detection
-- Brightness detection
-- Duplicate detection using pHash
-- OCR using Tesseract
-- Indian vehicle registration format validation
-- Screenshot/editing heuristic
-- Docker Compose
-- Automated tests
-
----
-
-## 3. Architecture
+## Architecture
 
 ```
 Client
-  |
-  v
+  ↓
 FastAPI API
-  |
-  +---- PostgreSQL
-  |
-  +---- Local Storage
-  |
-  v
-Redis Queue
-  |
-  v
-RQ Worker
-  |
-  v
-Image Analyzers
-  |
-  v
-PostgreSQL Results
+  ├── PostgreSQL (metadata + results)
+  ├── Local image storage
+  └── Redis queue
+          ↓
+       RQ Worker
+          ↓
+    Image Analyzers
+          ↓
+      PostgreSQL
+          ↓
+      Results API
 ```
 
-| Component | Purpose |
+| Component | Role |
 |---|---|
-| FastAPI | HTTP API, upload validation, and Swagger documentation |
-| PostgreSQL | Image metadata and analysis results |
-| Redis + RQ | Background job queue |
-| Worker | Runs image analyzers and stores results |
-| Local Storage | Stores uploaded image files |
+| **FastAPI** | Upload validation, status/results APIs, Swagger docs |
+| **PostgreSQL** | Image metadata and analysis JSONB |
+| **Redis + RQ** | Background job queue (`image_jobs`) |
+| **Worker** | Runs analyzers and persists results |
+| **Local storage** | Uploaded image files (shared Docker volume) |
 
-The API and worker use the same Docker image with different startup commands. A named volume shares uploaded files between them.
+The API and worker share the same Docker image. Locally they run as separate Compose services; the API enqueues jobs and the worker consumes them.
 
----
+## Tech Stack
 
-## 4. Processing Flow
+| Layer | Technologies |
+|---|---|
+| API | Python, FastAPI, Uvicorn, Pydantic |
+| Database | PostgreSQL, SQLAlchemy, Alembic |
+| Queue | Redis, RQ |
+| Image analysis | OpenCV, Pillow, imagehash, pytesseract |
+| Testing | pytest, httpx |
+| Deployment | Docker, Docker Compose |
+
+## Project Structure
 
 ```
-Upload
-→ Validate (size, type, decodable)
-→ Store image to disk
-→ Create processing ID (UUID)
-→ Queue background job
-→ Return 202 Accepted
-
-Worker
-→ Set status: processing
-→ Run image analyzers
-→ Persist results
-→ Set status: completed (or failed + failure_reason)
-
-Client
-→ Poll GET /status
-→ Fetch GET /results
+app/
+  analyzers/      # blur, brightness, duplicate, OCR, plate validator, screenshot
+  api/routes/     # health, images endpoints
+  core/           # config, logging, exceptions
+  db/             # models, database session
+  queue/          # RQ job enqueue + worker target
+  schemas/        # Pydantic request/response models
+  services/       # upload, processing, query, storage
+  workers/        # worker entry point
+tests/            # pytest suite
+samples/          # place assignment sample images here
+frontend/         # optional React dashboard (bonus)
+storage/original/ # uploaded images (gitignored contents)
+scripts/          # wait_for_db.py, start.sh
+alembic/          # database migrations
+docker-compose.yml
+Dockerfile
+requirements.txt
+.env.example
+pytest.ini
+README.md
 ```
 
-Each analyzer runs independently — an OCR failure does not abort blur or duplicate checks. If Redis is unavailable at enqueue time, the uploaded file and database row are cleaned up and the client receives `503`.
+## Getting Started
 
----
-
-## 5. Image Analysis
-
-All thresholds are configurable via environment variables (see `.env.example`).
-
-| Analyzer | Purpose | Method |
-|---|---|---|
-| Blur | Detect potentially blurry images | Variance of Laplacian |
-| Brightness | Detect very dark images | Mean grayscale |
-| Duplicate | Detect previously processed images | pHash + Hamming distance |
-| OCR | Extract text | Tesseract |
-| Vehicle Number | Validate Indian registration format | Boundary-aware regex |
-| Screenshot | Detect possible screenshot/editing signals | EXIF and resolution heuristics |
-
-> These are heuristics, not calibrated ML probabilities. Confidence values (`0–1`) are heuristic indicators and should not be treated as guaranteed probabilities.
-
-**Vehicle number validation** matches two formats:
-
-- Standard: `KA01AB1234`, `KA 01 AB 1234`, `KA-01-AB-1234`, `DL1CAA1234`
-- Bharat series: `22BH1234AA`, `22 BH 1234 AA`, `22-BH-1234-AA`
-
-`format_valid: true` means the OCR text resembles a valid Indian registration pattern. It does **not** prove the plate is genuine, issued, or correctly read. The validator uses boundary-aware token matching so unrelated text such as dates or addresses (e.g. `Tuesday, 17 Feb 2026`) is never misidentified as a plate number.
-
----
-
-## 6. API Endpoints
-
-| Method | Endpoint | Purpose |
-|---|---|---|
-| GET | /api/v1/health | Health check |
-| POST | /api/v1/images | Upload image |
-| GET | /api/v1/images/{processing_id}/status | Check processing status |
-| GET | /api/v1/images/{processing_id}/results | Get analysis results |
-
-Interactive docs: **http://localhost:8000/docs**
-
-Upload returns HTTP `202`. Status progresses through `pending` → `processing` → `completed` / `failed`.
-
-**Upload**
+**Requirements:** Git, Docker Desktop (or Docker Engine + Compose)
 
 ```bash
-curl -X POST -F "image=@vehicle.jpg" http://localhost:8000/api/v1/images
+git clone https://github.com/Sunil-s-3/intelligent-media-processing-pipeline.git
+cd intelligent-media-processing-pipeline
+```
+
+Optional — copy environment template (Docker Compose sets variables automatically):
+
+```bash
+cp .env.example .env
+```
+
+Start all services:
+
+```bash
+docker compose up -d --build
+```
+
+Verify containers are running:
+
+```bash
+docker compose ps
+```
+
+Expected services: `api`, `worker`, `postgres`, `redis` — all healthy/running.
+
+Open Swagger UI:
+
+**http://localhost:8000/docs**
+
+Upload an image via **POST /api/v1/images**, copy the returned `processing_id`, poll **GET /api/v1/images/{processing_id}/status**, then fetch **GET /api/v1/images/{processing_id}/results** when status is `completed`.
+
+The worker processes images asynchronously — allow a few seconds after upload before checking results.
+
+## API Endpoints
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/api/v1/health` | Health check |
+| POST | `/api/v1/images` | Upload image (returns `202`) |
+| GET | `/api/v1/images/{processing_id}/status` | Processing status |
+| GET | `/api/v1/images/{processing_id}/results` | Analysis results |
+
+**Upload example:**
+
+```bash
+curl -X POST -F "image=@path/to/vehicle.jpg" http://localhost:8000/api/v1/images
 ```
 
 ```json
@@ -136,236 +146,146 @@ curl -X POST -F "image=@vehicle.jpg" http://localhost:8000/api/v1/images
 }
 ```
 
-**Status**
+**Status values:** `pending` → `processing` → `completed` or `failed` (with `failure_reason` when failed).
 
-```bash
-curl http://localhost:8000/api/v1/images/<processing_id>/status
+## Processing Flow
+
+```
+Upload → validate file → save to disk → create processing_id → enqueue RQ job → return 202
+Worker → status: processing → run analyzers → save results → status: completed/failed
+Client → poll /status → fetch /results
 ```
 
-```json
-{ "processing_id": "...", "status": "completed" }
-```
+Each analyzer runs independently — an OCR failure does not stop blur or duplicate checks.
 
-**Results** (field shapes shown; numbers are illustrative, not recorded sample output)
+## Image Analysis
 
-```bash
-curl http://localhost:8000/api/v1/images/<processing_id>/results
-```
+| Analyzer | Method | Notes |
+|---|---|---|
+| **Blur** | Variance of Laplacian | Lower score may indicate blur |
+| **Brightness** | Mean grayscale | Flags very dark images |
+| **Duplicate** | pHash + Hamming distance | Compares against stored hashes |
+| **OCR** | Tesseract (full image + plate-focused regions) | General text + small plate crops |
+| **Vehicle number** | Boundary-aware regex | Standard + Bharat series; format only |
+| **Screenshot / editing** | EXIF + resolution heuristics | Weak signals, not forensic proof |
 
-```json
-{
-  "processing_id": "...",
-  "status": "completed",
-  "analysis": {
-    "image_quality": {
-      "blur":       { "detected": false, "score": 182.4, "confidence": 0.91 },
-      "brightness": { "issue": false, "average_brightness": 128.4, "confidence": 0.93 }
-    },
-    "duplicate":      { "detected": false, "matched_image_id": null },
-    "ocr":            { "status": "completed", "ocr_text": "KA01AB1234" },
-    "vehicle_number": { "format_valid": true, "matched_value": "KA01AB1234", "matched_pattern": "standard" },
-    "screenshot":     { "detected": false }
-  }
-}
-```
+> **Important:** These are heuristic checks. Confidence values (0–1) are indicators, not calibrated probabilities. `format_valid: true` does not prove a plate is genuine or correctly read.
 
----
+## Testing
 
-## 7. Running with Docker
-
-Docker Compose is the primary and validated setup method.
-
-```bash
-docker compose up --build
-```
-
-Starts four services: API (port 8000), Worker, PostgreSQL (port 5432), Redis (port 6379). The API and worker both run `alembic upgrade head` on startup after PostgreSQL becomes healthy.
-
-Open **http://localhost:8000/docs** to explore the API interactively.
-
----
-
-## 8. Testing
-
-Tests use SQLite in-memory and mock the RQ enqueue call — no live PostgreSQL, Redis, or Tesseract required.
+**Automated tests** (inside Docker — recommended):
 
 ```bash
 docker compose exec api pytest -q
 ```
 
-**43 tests passed, 1 warning.**
+**49 passed, 1 warning** (verified). Tests use SQLite in-memory and mock RQ enqueue — no live PostgreSQL, Redis, or Tesseract required in the test suite.
 
-Coverage includes: health endpoint, upload validation (corrupt, oversized, unsupported type), status and results endpoints, blur and brightness analyzers, duplicate pHash detection, plate validator (valid formats, false-positive regression for dates and address text), OCR isolation with mocked Tesseract, and worker success/failure paths.
-
-To run locally without Docker:
+**Local pytest** (without Docker):
 
 ```bash
 python -m venv .venv
-# Windows: .\.venv\Scripts\Activate.ps1
-# Unix:    source .venv/bin/activate
 pip install -r requirements.txt
-pytest -q
+python -m pytest -q
 ```
 
----
+### Sample image testing (assignment requirement)
 
-## 9. Configuration
+The assignment asks for testing with **3 sample vehicle images**. Place the company-provided images in `samples/` (this directory currently contains instructions only — add the actual image files before testing).
 
-Copy `.env.example` to `.env` and edit as needed. Do not commit `.env`.
+For each sample image:
+
+1. Open **http://localhost:8000/docs**
+2. Use **POST /api/v1/images** — upload the file (field name: `image`)
+3. Copy the returned `processing_id`
+4. Call **GET /api/v1/images/{processing_id}/status** until status is `completed` or `failed`
+5. Call **GET /api/v1/images/{processing_id}/results** and review the analysis JSON
+6. Capture a screenshot of the results (Swagger response or optional dashboard)
+
+Or via curl:
 
 ```bash
-cp .env.example .env
+curl -X POST -F "image=@samples/<your-sample-filename>.jpg" http://localhost:8000/api/v1/images
+curl http://localhost:8000/api/v1/images/<processing_id>/status
+curl http://localhost:8000/api/v1/images/<processing_id>/results
 ```
 
-| Variable | Purpose |
+Do not assume specific outputs — results depend on each image.
+
+## Sample Test Result
+
+The following was observed during dashboard testing with one real vehicle image (not all three assignment samples):
+
+| Check | Observed result |
 |---|---|
-| `DATABASE_URL` | PostgreSQL connection string |
-| `REDIS_URL` | Redis connection string |
-| `STORAGE_PATH` | Directory for uploaded image files |
-| `MAX_UPLOAD_SIZE_MB` | Maximum allowed upload size |
-| `BLUR_THRESHOLD` | Laplacian variance below which blur is flagged |
-| `BRIGHTNESS_THRESHOLD` | Mean pixel value below which low-light is flagged |
-| `DUPLICATE_HASH_DISTANCE` | Maximum pHash Hamming distance treated as a duplicate |
+| Processing | Completed |
+| Blur | Not blurry (Laplacian variance ~1928, threshold 100) |
+| Brightness | No low-light issue (average ~117, threshold 50) |
+| Duplicate | Duplicate detected on re-upload (similarity 100%, Hamming distance 0) |
+| OCR | Text extracted from image |
+| Vehicle number | No valid standard/Bharat pattern detected (heuristic — OCR may miss small plates) |
+| Screenshot/editing | No strong signal detected |
 
-Docker Compose sets all required variables automatically.
+This confirms end-to-end processing, duplicate detection, and structured results. Individual sample-image outputs should be captured separately when testing all three assignment images.
 
----
-
-## 10. Error Handling
-
-| Status | Meaning |
-|---|---|
-| 202 | Image accepted and queued for processing |
-| 400 | Missing, empty, corrupt, or undecodable file |
-| 404 | Unknown `processing_id` |
-| 413 | File exceeds upload size limit |
-| 415 | Unsupported image format |
-| 503 | Database or Redis unavailable at upload time |
-
-Internal Python stack traces are logged server-side and are never returned in JSON responses. Failed jobs include a human-readable `failure_reason` in the status and results responses.
-
----
-
-## 11. Queue Strategy
-
-Redis + RQ was chosen for the background queue because:
-
-- It matches the assignment's specified stack
-- It keeps the API process free of CPU-heavy OCR and image analysis work
-- Built-in `Retry` support handles transient worker failures without a second message bus
-- The operational model is simple: one named queue (`image_jobs`), one worker command
-
-RQ is not Kafka, Celery, or a custom broker. For a take-home assignment that is a deliberate feature — fewer moving parts with the same async decoupling. Non-retryable failures (corrupt or missing images) are caught inside the job and marked `failed` without re-queuing; transient infrastructure errors are re-raised so RQ can retry up to `JOB_RETRY_MAX` times.
-
----
-
-## 12. Assumptions
-
-- Uploaded files are expected to be still images (JPEG, PNG, WEBP, BMP, TIFF); video is not supported
-- Indian vehicle registration validation is format validation only — it does not verify that a plate is genuine, issued, or correctly read by OCR
-- Local filesystem storage is acceptable for a take-home environment where the API and worker run on the same host via Docker Compose
-- Heuristic analysis (blur, brightness, duplicate, screenshot) is intended to flag possible issues, not prove them; confidence values are not calibrated ML probabilities
-- English Tesseract language data is sufficient for this use case
-- A linear pHash database scan is acceptable at take-home dataset scale
-
----
-
-## 13. Design Decisions & Trade-offs
-
-| Decision | Rationale | Trade-off |
-|---|---|---|
-| Redis + RQ | Simple, assignment-specified, process isolation, retry support | Less tooling than Celery; no delayed routing beyond Retry |
-| Local filesystem | No cloud credentials required; easy Docker volume sharing | Not suitable for multi-host or production deployments |
-| PostgreSQL JSONB for results | Analyzer output shapes can evolve without schema migrations | Weaker column-level constraints than typed columns |
-| Independent analyzers | One analyzer failure does not abort the others | Each failure is isolated; the job still completes |
-| Heuristic analysis | Honest about uncertainty; matches assignment intent | False positives and negatives are possible; thresholds need tuning |
-| SQLite in tests | Tests run without Docker, PostgreSQL, Redis, or Tesseract | JSONB-specific PostgreSQL behaviour is not exercised in pytest |
-| Processing ID = `images.id` | One UUID, no extra lookup column | None for this scale |
-
----
-
-## 14. Scalability Considerations
-
-The current implementation is intentionally scoped for a take-home assignment and is not designed for large-scale production use.
-
-| Area | Current approach | Production path |
-|---|---|---|
-| Image storage | Local filesystem via Docker volume | Object storage (S3/GCS); DB stores object keys |
-| Duplicate detection | Linear pHash scan across all stored hashes | Approximate nearest-neighbour index (FAISS, pgvector) |
-| Workers | Single RQ worker process | Multiple workers; queue partitioning by priority |
-| API scaling | Single Uvicorn process | Horizontal replicas behind a load balancer |
-| Queue monitoring | RQ built-in | Dead-letter registry, metrics, structured log collector |
-
----
-
-## 15. Limitations
-
-- Local storage is not suitable for multi-host production deployment
-- pHash duplicate detection uses a full database scan and will not scale to very large datasets
-- OCR quality depends on image quality, angle, and lighting
-- Vehicle number validation checks format only and does not verify authenticity
-- Screenshot detection is a lightweight heuristic, not a forensic tool
-
----
-
-## 16. Future Improvements
-
-- Object storage such as S3/GCS
-- Multiple workers and queue partitioning
-- Plate region detection before OCR
-- Scalable pHash similarity search (ANN index or pgvector)
-- Authentication, rate limiting, and monitoring
-
----
-
-## 17. Validation (Verified Results)
-
-| Check | Result |
-|---|---|
-| Automated tests | 43 passed, 1 warning |
-| Docker Compose build | Successful |
-| Docker Compose startup | Successful |
-| PostgreSQL | Healthy |
-| Redis | Healthy |
-| Health endpoint | `{"status":"ok"}` |
-| Image upload | HTTP 202, `processing_id` returned |
-| Background processing | Status transitioned to `completed` |
-| Status endpoint | `completed` returned |
-| Results endpoint | Analysis JSON returned |
-| Duplicate detection | Second upload of the same image correctly flagged |
-
----
-
-## 18. AI Usage Disclosure
+## AI Usage Disclosure
 
 Cursor/AI tools were used during development for:
 
-- Implementation assistance and boilerplate generation (FastAPI app, SQLAlchemy models, Alembic migration, Docker Compose, config and logging setup)
-- Image analyzer implementations (OpenCV Laplacian blur, mean brightness, imagehash pHash duplicates, pytesseract OCR, plate regex, EXIF screenshot heuristic)
-- Test creation (pytest + TestClient cases for upload, status, results, analyzers, OCR isolation, worker paths)
-- Debugging and review (exception handler tightening, chunked upload size check, worker migration wait)
-- Documentation (this README)
+- Project structure and design discussion
+- Implementation assistance (FastAPI routes, analyzers, Docker setup)
+- Debugging and code review
+- Test generation and review
+- README and documentation
 
-All generated code was reviewed, modified where necessary, and validated using the automated test suite and Docker Compose end-to-end workflow.
+AI-generated suggestions were **not** accepted blindly. Code was reviewed, modified, and validated through automated tests and manual API/dashboard testing.
 
-**Concrete example of an AI-generated error and how it was corrected:**
+**Example:** An early plate validator concatenated all OCR text before regex matching, producing a false positive (`AY17FEB2026`) from date text like `Tuesday, 17 Feb 2026`. This was caught during manual testing, fixed with boundary-aware token matching, and locked in with regression tests (`test_observed_ocr_dump_does_not_fabricate_ay17feb2026`).
 
-The initial vehicle-number validator used broad normalization: it stripped all non-alphanumeric characters from the entire OCR text and then searched the resulting concatenated string with a regex. This caused a false positive during API testing — the OCR text `"Tuesday, 17 Feb 2026 11:22 AM Perambur High Road"` was normalized to `"TUESDAY17FEB202611..."` and the regex found `"AY17FEB2026"` within that string, incorrectly returning `format_valid: true` with `matched_value: "AY17FEB2026"`.
+Heuristic thresholds and analyzer behavior were validated by running the application, not by assuming AI output was correct.
 
-**How it was detected:** Manual API testing with a real image whose OCR output contained a date and address string — common in field-photographed images — produced an obviously wrong plate number.
+## Engineering Decisions / Trade-offs
 
-**What was changed:** The validator was refactored to use boundary-aware token matching. The OCR text is first split into alphanumeric tokens on whitespace and punctuation boundaries. Only short windows of consecutive tokens (up to 6) are joined and tested against the full plate pattern. This means `"Tuesday"`, `"17"`, `"Feb"`, `"2026"` are never concatenated across word boundaries into a candidate string.
+- **Redis + RQ** — simple async processing without heavier queue infrastructure
+- **Local storage** — no cloud credentials needed for the take-home; API and worker share a Docker volume
+- **PostgreSQL JSONB** — flexible analyzer result shapes without frequent schema changes
+- **Isolated analyzers** — one analyzer failure does not abort the entire job
+- **RQ retries** — transient worker failures may retry up to `JOB_RETRY_MAX`
+- **Heuristic confidence** — explicitly labeled as non-calibrated
+- **Linear pHash scan** — acceptable at take-home scale; would need an ANN index at larger scale
 
-**How the fix was validated:** A regression test (`test_observed_ocr_dump_does_not_fabricate_ay17feb2026`) was added using the exact OCR text that triggered the false positive. Additional tests cover date strings, hyphenated dates, address text, and embedded legitimate plates. All 43 tests pass, including this regression test, and the API was re-verified manually through Swagger.
+## Limitations / Future Improvements
 
-**Validation summary:**
+- Dedicated license plate detection before OCR
+- Stronger OCR preprocessing for small/degraded plates
+- Calibrated ML confidence scores
+- Object storage (S3/GCS) instead of local disk
+- Scalable pHash indexing (pgvector, FAISS)
+- Stronger tamper detection (beyond lightweight EXIF heuristics)
+- Authentication, rate limiting, observability
+- Multiple distributed workers
 
-- 43 automated tests passed (Python 3.11, SQLite in-memory, RQ enqueue mocked)
-- Docker Compose was successfully built and run end-to-end
-- All API endpoints were manually verified through Swagger (`/docs`) and curl
+## Assumptions
 
----
+- Uploaded files are still images (JPEG, PNG, WEBP, BMP, TIFF)
+- Indian registration validation is **format-based only** — not proof of authenticity
+- OCR can be inaccurate, especially on small or angled plates
+- Missing EXIF does not prove a screenshot or edit
+- Duplicate detection uses perceptual similarity, not byte-identical matching
+- Heuristic confidence is not a probability
 
-## 19. Submission
+## Stopping the Project
 
-This repository contains the application source code, tests, Docker configuration, database migration, configuration example, and documentation required to run and evaluate the assignment.
+Stop containers:
+
+```bash
+docker compose down
+```
+
+Remove containers **and** volumes (deletes PostgreSQL data and uploaded images):
+
+```bash
+docker compose down -v
+```
+
+Use `-v` only when you want a clean reset.
