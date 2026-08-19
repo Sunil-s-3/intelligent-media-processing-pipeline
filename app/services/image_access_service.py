@@ -67,24 +67,38 @@ def _worker_temp_dir() -> Path:
     return directory
 
 
-def download_image_from_api(processing_id: str, stored_filename: str) -> Path:
-    """Download an image from the API service into the worker temp directory."""
+def build_image_download_url(processing_id: str) -> str:
+    """Build the worker download URL for an uploaded image."""
     base_url = settings.internal_api_base_url
     if not base_url:
         raise ImageFileMissingError("Stored image file is missing on disk")
-
     if not _PROCESSING_ID_RE.fullmatch(processing_id):
         raise ImageDownloadNotFoundError("Image file not found on API service")
+    return f"{base_url}/api/v1/images/{processing_id}/file"
+
+
+def download_image_from_api(processing_id: str, stored_filename: str) -> Path:
+    """Download an image from the API service into the worker temp directory."""
+    if not settings.internal_api_base_url:
+        raise ImageFileMissingError("Stored image file is missing on disk")
 
     try:
         filename = _safe_stored_filename(stored_filename)
     except ImageNotFoundError as exc:
         raise ImageDownloadNotFoundError(exc.message) from exc
 
-    url = f"{base_url}/api/v1/images/{processing_id}/file"
+    url = build_image_download_url(processing_id)
+    timeout = httpx.Timeout(settings.IMAGE_DOWNLOAD_TIMEOUT_SECONDS)
+
+    logger.info(
+        "starting API image download url=%s timeout_seconds=%s",
+        url,
+        settings.IMAGE_DOWNLOAD_TIMEOUT_SECONDS,
+        extra={"processing_id": processing_id},
+    )
 
     try:
-        with httpx.Client(timeout=settings.IMAGE_DOWNLOAD_TIMEOUT_SECONDS) as client:
+        with httpx.Client(timeout=timeout) as client:
             response = client.get(url)
     except (
         httpx.TimeoutException,
@@ -92,9 +106,21 @@ def download_image_from_api(processing_id: str, stored_filename: str) -> Path:
         httpx.NetworkError,
         httpx.ReadError,
     ) as exc:
+        logger.error(
+            "API image download failed (transient) error=%s",
+            exc,
+            extra={"processing_id": processing_id},
+        )
         raise ImageDownloadTransientError(
             f"Failed to download image from API service: {exc}"
         ) from exc
+
+    logger.info(
+        "API image download response status=%s bytes=%s",
+        response.status_code,
+        len(response.content),
+        extra={"processing_id": processing_id},
+    )
 
     if response.status_code == 404:
         raise ImageDownloadNotFoundError("Image file not found on API service")
@@ -113,7 +139,8 @@ def download_image_from_api(processing_id: str, stored_filename: str) -> Path:
     temp_path = _worker_temp_dir() / filename
     temp_path.write_bytes(response.content)
     logger.info(
-        "image downloaded from API bytes=%s",
+        "API image download completed temp_path=%s bytes=%s",
+        temp_path,
         len(response.content),
         extra={"processing_id": processing_id},
     )
@@ -145,20 +172,45 @@ def _local_image_path(image: Image) -> Path | None:
 def resolve_processing_image_path(image: Image) -> Iterator[Path]:
     """Yield a readable local image path, downloading from the API if needed."""
     local_path = _local_image_path(image)
+    api_configured = settings.internal_api_base_url is not None
+
+    logger.info(
+        "resolving image path local_exists=%s api_fallback_configured=%s storage_path=%s",
+        local_path is not None,
+        api_configured,
+        image.storage_path,
+        extra={"processing_id": image.id},
+    )
+
     if local_path is not None:
+        logger.info(
+            "using local image path=%s",
+            local_path,
+            extra={"processing_id": image.id},
+        )
         yield local_path
         return
 
     temp_path: Path | None = None
     try:
+        logger.info(
+            "local image missing; using API download fallback",
+            extra={"processing_id": image.id},
+        )
         temp_path = download_image_from_api(image.id, image.stored_filename)
         yield temp_path
     finally:
         if temp_path is not None and temp_path.exists():
             try:
                 temp_path.unlink()
+                logger.info(
+                    "temporary downloaded image deleted path=%s",
+                    temp_path,
+                    extra={"processing_id": image.id},
+                )
             except OSError:
                 logger.warning(
-                    "failed to delete temporary downloaded image",
+                    "failed to delete temporary downloaded image path=%s",
+                    temp_path,
                     extra={"processing_id": image.id},
                 )

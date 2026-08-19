@@ -1,4 +1,5 @@
 import uuid
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
@@ -6,10 +7,12 @@ import pytest
 
 from app.core.config import settings
 from app.db.models import AnalysisResult, Image, ProcessingStatus
-from app.services.image_access_service import resolve_processing_image_path
+from app.queue.jobs import process_image_job
+from app.services.image_access_service import build_image_download_url, resolve_processing_image_path
 from app.services.processing_service import (
     NonRetryableProcessingError,
     RetryableProcessingError,
+    mark_processing_failed,
     _process_with_session,
 )
 from tests.helpers import noisy_image, png_bytes, save_png
@@ -164,3 +167,71 @@ def test_resolve_processing_image_path_cleans_up_temp_file(db_session, tmp_path,
             assert image_path == temp_file
 
     assert not temp_file.exists()
+
+
+def test_build_image_download_url_strips_trailing_slash(monkeypatch):
+    monkeypatch.setattr(settings, "INTERNAL_API_BASE_URL", "http://api.test/")
+    processing_id = "b368827f-7718-43a6-b6ab-bad2b6abf850"
+    assert (
+        build_image_download_url(processing_id)
+        == f"http://api.test/api/v1/images/{processing_id}/file"
+    )
+
+
+def test_worker_download_5xx_is_retryable(db_session, tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "INTERNAL_API_BASE_URL", "http://api.test")
+    monkeypatch.setattr(settings, "WORKER_TEMP_PATH", str(tmp_path / "worker-temp"))
+    record = _insert_image(db_session, tmp_path, missing_file=True)
+
+    class FakeResponse:
+        status_code = 503
+        content = b""
+
+    with patch("app.services.image_access_service.httpx.Client.get", return_value=FakeResponse()):
+        with pytest.raises(RetryableProcessingError):
+            _process_with_session(db_session, record.id)
+
+    db_session.refresh(record)
+    assert record.status == ProcessingStatus.PROCESSING.value
+
+
+def test_mark_processing_failed_updates_processing_record(db_session, tmp_path, monkeypatch):
+    record = _insert_image(db_session, tmp_path)
+    record.status = ProcessingStatus.PROCESSING.value
+    db_session.commit()
+
+    class SessionWrapper:
+        def get(self, *args, **kwargs):
+            return db_session.get(*args, **kwargs)
+
+        def commit(self) -> None:
+            db_session.commit()
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        "app.services.processing_service.SessionLocal",
+        lambda: SessionWrapper(),
+    )
+    mark_processing_failed(record.id, "Processing failed after retries: timeout")
+
+    db_session.refresh(record)
+    assert record.status == ProcessingStatus.FAILED.value
+    assert "retries" in record.failure_reason.lower()
+
+
+def test_process_image_job_marks_failed_when_retries_exhausted():
+    mock_job = SimpleNamespace(retries_left=0)
+    with patch("rq.get_current_job", return_value=mock_job):
+        with patch(
+            "app.services.processing_service.process_image",
+            side_effect=RetryableProcessingError("download timed out"),
+        ):
+            with patch("app.services.processing_service.mark_processing_failed") as mark_failed:
+                result = process_image_job("b368827f-7718-43a6-b6ab-bad2b6abf850")
+                assert result == "b368827f-7718-43a6-b6ab-bad2b6abf850"
+                mark_failed.assert_called_once_with(
+                    "b368827f-7718-43a6-b6ab-bad2b6abf850",
+                    "Processing failed after retries: download timed out",
+                )

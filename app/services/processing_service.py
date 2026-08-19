@@ -78,6 +78,19 @@ def _run_analyzer(name: str, processing_id: str, func, *args, **kwargs) -> dict:
         }
 
 
+def mark_processing_failed(processing_id: str, reason: str) -> None:
+    """Mark a processing record failed if it is still in-flight."""
+    db = SessionLocal()
+    try:
+        image = db.get(Image, processing_id)
+        if image is None:
+            return
+        if image.status == ProcessingStatus.PROCESSING.value:
+            _mark_failed(db, image, reason)
+    finally:
+        db.close()
+
+
 def process_image(processing_id: str) -> None:
     """RQ entry-point compatible function. Opens its own DB session."""
     db = SessionLocal()
@@ -161,6 +174,11 @@ def _process_with_session(db: Session, processing_id: str) -> None:
         )
         raise RetryableProcessingError(str(exc)) from exc
     except (ImageFileMissingError, ImageDownloadNotFoundError) as exc:
+        logger.error(
+            "permanent image access failure error=%s",
+            exc,
+            extra={"processing_id": processing_id},
+        )
         _mark_failed(db, image, str(exc))
         raise NonRetryableProcessingError(str(exc)) from exc
     except NonRetryableProcessingError:

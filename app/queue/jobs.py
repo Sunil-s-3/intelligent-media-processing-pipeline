@@ -46,9 +46,12 @@ def enqueue_image_job(processing_id: str) -> str:
 
 def process_image_job(processing_id: str) -> str:
     """RQ target. Import is deferred so the worker process loads app code once."""
+    from rq import get_current_job
+
     from app.services.processing_service import (
         NonRetryableProcessingError,
         RetryableProcessingError,
+        mark_processing_failed,
         process_image,
     )
 
@@ -62,9 +65,25 @@ def process_image_job(processing_id: str) -> str:
             extra={"processing_id": processing_id},
         )
         return processing_id
-    except RetryableProcessingError:
-        logger.warning(
-            "job will be retried if attempts remain",
+    except RetryableProcessingError as exc:
+        job = get_current_job()
+        retries_left = getattr(job, "retries_left", None) if job is not None else None
+        if retries_left is None or retries_left > 0:
+            logger.warning(
+                "job will be retried if attempts remain retries_left=%s error=%s",
+                retries_left,
+                exc,
+                extra={"processing_id": processing_id},
+            )
+            raise
+
+        logger.error(
+            "job retries exhausted; marking processing failed error=%s",
+            exc,
             extra={"processing_id": processing_id},
         )
-        raise
+        mark_processing_failed(
+            processing_id,
+            f"Processing failed after retries: {exc}",
+        )
+        return processing_id
