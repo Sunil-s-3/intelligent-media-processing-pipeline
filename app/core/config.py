@@ -46,6 +46,13 @@ class Settings(BaseSettings):
 
     ALLOWED_IMAGE_FORMATS: set[str] = {"JPEG", "PNG", "WEBP", "BMP", "TIFF"}
 
+    # Comma-separated browser origins allowed to call the API (CORS).
+    FRONTEND_ORIGINS: str = (
+        "https://intelligent-media-processing-pipeline-oido.onrender.com,"
+        "http://localhost:5173,"
+        "http://localhost:5174"
+    )
+
     @property
     def max_upload_bytes(self) -> int:
         return int(self.MAX_UPLOAD_SIZE_MB * 1024 * 1024)
@@ -53,6 +60,14 @@ class Settings(BaseSettings):
     @property
     def storage_dir(self) -> Path:
         return Path(self.STORAGE_PATH).resolve()
+
+    @property
+    def frontend_origins(self) -> list[str]:
+        return [
+            origin.strip()
+            for origin in self.FRONTEND_ORIGINS.split(",")
+            if origin.strip()
+        ]
 
 
 @lru_cache
