@@ -1,0 +1,50 @@
+# Environment and secrets
+.env
+.env.local
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Testing / lint
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Storage (keep directory via .gitkeep)
+storage/original/*
+!storage/original/.gitkeep
+
+# Sample vehicle images — never commit real photos
+samples/*.jpg
+samples/*.jpeg
+samples/*.png
+samples/*.webp
+samples/*.bmp
+samples/*.tiff
+samples/*.tif
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

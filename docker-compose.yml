@@ -1,0 +1,74 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: media_pipeline
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d media_pipeline"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://app:app@postgres:5432/media_pipeline
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_PATH: /app/storage/original
+      RQ_QUEUE_NAME: image_jobs
+      LOG_LEVEL: INFO
+    volumes:
+      - image_storage:/app/storage/original
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build: .
+    command: >
+      sh -c "python scripts/wait_for_db.py &&
+             alembic upgrade head &&
+             rq worker image_jobs --url redis://redis:6379/0"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://app:app@postgres:5432/media_pipeline
+      REDIS_URL: redis://redis:6379/0
+      STORAGE_PATH: /app/storage/original
+      RQ_QUEUE_NAME: image_jobs
+      LOG_LEVEL: INFO
+      PYTHONPATH: /app
+    volumes:
+      - image_storage:/app/storage/original
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+
+volumes:
+  postgres_data:
+  image_storage:
