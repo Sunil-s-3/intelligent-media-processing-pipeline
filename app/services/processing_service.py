@@ -123,6 +123,10 @@ def _process_with_session(db: Session, processing_id: str) -> None:
         )
         ocr = _run_analyzer("ocr", processing_id, analyze_ocr, stored)
         plate = validate_indian_plate(ocr.get("cleaned_text") or ocr.get("ocr_text"))
+        if not plate.get("format_valid") and ocr.get("plate_ocr_text"):
+            plate_from_region = validate_indian_plate(ocr.get("plate_ocr_text"))
+            if plate_from_region.get("format_valid"):
+                plate = plate_from_region
 
         if image.analysis is None:
             result = AnalysisResult(
